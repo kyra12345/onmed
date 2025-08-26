@@ -7,7 +7,7 @@
 <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
 <!-- SheetJS to read Excel -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-<title>US Counties – HPSA legend + Hospitals (Excel) & Stations</title>
+<title>US Counties – HPSA legend + Hospitals & Stations</title>
 <style>
   html,body { height:100%; margin:0; }
   #map { height:100%; }
@@ -78,8 +78,8 @@
 
 <script>
 (function(){
-  const GEOJSON_URL   = 'georef-united-states-of-america-county.json'; // same folder
-  const HOSPITALS_XLSX= 'allHospitals.xlsx'; // your Excel filename
+  const GEOJSON_URL   = 'georef-united-states-of-america-county.json'; 
+  const HOSPITALS_XLSX= 'allHospitals.xlsx';  
 
   const SOURCE_ID   = 'us-counties';
   const FILL_LAYER  = 'counties-fill';
@@ -434,7 +434,7 @@ function normHospital(r){
   const name    = G(clean,'name','hospitalname','hospit al_name') || r.Name || r['Hospital Name'];
   const address = G(clean,'address','street') || r.Address;
 
-  let postal = G(clean,'zip','postal','postalcode');        // you can keep your ZIP fallback below if you like
+  let postal = G(clean,'zip','postal','postalcode');         
 
   if (!postal && address) postal = extractUSZipFromAddress(address);
 
@@ -520,7 +520,7 @@ function normHospital(r){
   let stationMarkers  = [];
   let usaBounds = null;
 
-  // Hard-coded stations (edit these)
+  // Hard-coded stations  
   const HARD_STATIONS = [
     { title:'HHC: The Village',   lon:-72.6737, lat:41.747 },
     { title:'HHC: Stop and Shop', lon:-71.8809, lat:41.84  },
@@ -629,7 +629,7 @@ function normHospital(r){
     // Load hospitals once
     await loadHospitalsFromExcel();
 
-    // Hospitals by ZIP (wide fit + not-too-deep zoom)
+    // Hospitals by ZIP  
     function clearHospitals(){ hospitalMarkers.forEach(m => m.remove()); hospitalMarkers = []; }
 document.getElementById('btnHosp').addEventListener('click', async () => {
   const postalInput = document.getElementById('zip').value.trim();
@@ -645,7 +645,7 @@ document.getElementById('btnHosp').addEventListener('click', async () => {
     (digs && h.postalDigits === digs) ||
     (digs5 && h.postalDigits5 === digs5)
   );
-  if (!rows.length) { alert('No hospitals for that postal code in your Excel.'); return; }
+  if (!rows.length) { alert('No hospitals found for that postal code.'); return; }
 
   // geocode/zoom hints
   const { countryHint, viewbox, stName } = buildGeocodeHints(postalInput, rows);
@@ -710,7 +710,7 @@ const waitLine = waitVal
   : '';
       if (d <= radiusMi){
         const m = makeMarker('hospital', h.lon, h.lat, h.name);
-	m.setPopup(
+	m.setPopup(+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
   new maplibregl.Popup({ closeButton:true, closeOnClick:true })
     .setHTML(
       `<div class="popup">
@@ -792,3 +792,4 @@ window.__showHospitalsNear(g.lon, g.lat, 20);
 </script>
 </body>
 </html>
+
