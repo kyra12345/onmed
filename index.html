@@ -1,0 +1,794 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+<!-- SheetJS to read Excel -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<title>US Counties – HPSA legend + Hospitals (Excel) & Stations</title>
+<style>
+  html,body { height:100%; margin:0; }
+  #map { height:100%; }
+  .panel {
+    position:absolute; z-index:5; top:12px; left:12px;
+    background:rgba(255,255,255,.96); border:1px solid #d0d7de; border-radius:12px;
+    box-shadow:0 2px 8px rgba(0,0,0,.12); padding:10px 12px;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; max-width:360px;
+  }
+  .panel h3 { margin:0 0 8px; font-size:14px; color:#111; }
+  .row { display:flex; gap:6px; margin:6px 0; align-items:center; flex-wrap:wrap; }
+  .row label { font-size:12px; color:#333; }
+  .panel input, .panel select, .panel textarea, .panel button {
+    font-size:13px; border:1px solid #d0d7de; border-radius:8px; padding:7px 8px;
+  }
+  .panel select { min-width:180px; }
+  .panel textarea { width:100%; min-height:70px; }
+  .panel button { cursor:pointer; }
+  .legend { margin-top:10px; border-top:1px solid #eee; padding-top:8px; max-height:180px; overflow:auto; }
+  .legend-item { display:flex; align-items:center; gap:8px; padding:3px 0; }
+  .swatch { width:14px; height:14px; border-radius:3px; border:1px solid rgba(0,0,0,.2); }
+  .mk { width:14px; height:14px; border-radius:50%; border:2px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,.2); }
+  .mk.hospital { background:#2563eb; } /* blue */
+  .mk.station  { background:#000000; }  /* black */
+  .mk.station-temp { background:#00C853; } /* green for temporary typed stations */
+  .popup{font:12px/1.35 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .popup .h{font-weight:600;margin-bottom:2px}
+  .popup a{text-decoration:none}
+  .popup a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="panel">
+  <h3>Filters & Layers</h3>
+
+  <!-- State dropdown (only filters/zooms counties layer; does NOT drive hospitals) -->
+  <div class="row">
+    <label for="stateSelect">State:</label>
+    <select id="stateSelect">
+      <option value="">-- All states --</option>
+    </select>
+    <button id="btnStateGo">Go</button>
+    <button id="btnStateClear">Clear</button>
+  </div>
+
+  <div class="legend" id="legend"><strong style="font-size:12px;">HPSA Legend</strong></div>
+
+  <!-- ZIP search (drives hospital markers) -->
+  <div class="row" style="margin-top:8px;">
+    <label for="zip">Hospitals by ZIP:</label>
+    <input id="zip" placeholder="e.g., 10001" style="width:100px;">
+    <button id="btnHosp">Find</button>
+    <button id="btnHospClear" title="Remove hospital markers">Clear</button>
+  </div>
+
+  <!-- Stations -->
+  <div class="row" style="flex-direction:column; align-items:stretch;">
+    <label for="stations">Stations (one address per line):</label>
+    <textarea id="stations" placeholder="123 Main St, Springfield, IL&#10;10 Park Ave, New York, NY"></textarea>
+    <div class="row" style="justify-content:flex-end; width:100%;">
+      <button id="btnStationsAdd">Add stations</button>
+      <button id="btnStationsClear" title="Remove station markers">Clear</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const GEOJSON_URL   = 'georef-united-states-of-america-county.json'; // same folder
+  const HOSPITALS_XLSX= 'allHospitals.xlsx'; // your Excel filename
+
+  const SOURCE_ID   = 'us-counties';
+  const FILL_LAYER  = 'counties-fill';
+  const LINE_LAYER  = 'counties-outline';
+  const STATE_PROP  = 'State Name';
+  const FILL_PROP   = 'fill';
+  const HPSA_KEYS   = ['HPSA Region','HPSA_Region','hpsa_region','HPSA','hpsa','Region','region','label'];
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    style: 'https://demotiles.maplibre.org/style.json',
+    center: [-96, 38], zoom: 3.5
+  });
+
+  // ---------- Utilities ----------
+  function extendBoundsFromGeom(bounds, geom){
+    if (!geom) return;
+    if (geom.type === 'Polygon') {
+      for (const ring of geom.coordinates) for (const c of ring) bounds.extend(c);
+    } else if (geom.type === 'MultiPolygon') {
+      for (const poly of geom.coordinates) for (const ring of poly) for (const c of ring) bounds.extend(c);
+    }
+  }
+  function makeMarker(className, lng, lat, title){
+    const el = document.createElement('div');
+    el.className = `mk ${className}`;
+    if (title) el.title = title;
+    return new maplibregl.Marker({ element: el, anchor: 'center' }).setLngLat([lng, lat]).addTo(map);
+  }
+  function escapeHTML(s){return String(s||'').replace(/[&<>"']/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));}
+  // Global postal normalizer (letters/numbers, remove spaces/dashes)
+  function normalizePostal(s){
+    if (s == null) return '';
+    return String(s).trim().toUpperCase().replace(/[\s-]/g,'');
+  }
+  function fitSmart(bounds, {padding=50, duration=700, maxZoom=7.2}={}){
+    if (!bounds || bounds.isEmpty()) return;
+    map.fitBounds(bounds, { padding, duration, maxZoom });
+    map.once('moveend', () => { if (map.getZoom() > maxZoom) map.easeTo({ zoom:maxZoom, center:bounds.getCenter(), duration:200 }); });
+  }
+
+// Haversine distance in miles
+function distanceMiles(lon1, lat1, lon2, lat2){
+  const toRad = d => d * Math.PI / 180;
+  const R = 3958.7613; // Earth radius in miles
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+            Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+function fmtMi(mi){
+  return mi < 0.1 ? `${Math.round(mi*5280)} ft`
+                  : `${mi < 10 ? mi.toFixed(1) : Math.round(mi)} mi`;
+}
+
+// Remember the last typed address (your green marker)
+let lastOrigin = null; // {lon, lat, label}
+  // Prefer showing the entire state that contains a point (helps context on ZIP search)
+  const stateBounds = new Map();
+  function stateNameFromPoint(lon, lat){
+    for (const [name, b] of stateBounds.entries()){
+      if (b && b.contains([lon, lat])) return name;
+    }
+    return null;
+  }
+
+  // ---------- Station storage & persistence ----------
+// --- Station storage, persistence, deletion ---
+const PERM_ST_KEY = 'permStations.v1';
+let tempStations = [];              // [{id, marker, title}]
+let permStations = [];              // [{id, marker, title, lon, lat}]
+let ST_SEQ = 0;
+
+const genId = (p='st') => `${p}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+
+function savePermanentStationsToLS(list){ localStorage.setItem(PERM_ST_KEY, JSON.stringify(list)); }
+function loadPermanentStationsFromLS(){
+  try {
+    const arr = JSON.parse(localStorage.getItem(PERM_ST_KEY) || '[]');
+    // upgrade old entries (no id)
+    let changed = false;
+    for (const r of arr) {
+      if (!r.id) { r.id = genId('perm'); changed = true; }
+    }
+    if (changed) savePermanentStationsToLS(arr);
+    return arr;
+  } catch { return []; }
+}
+
+// Helpers to remove a saved permanent by id or by nearly-identical lon/lat/title
+function removePermFromLS(by){
+  const saved = loadPermanentStationsFromLS();
+  const out = saved.filter(r => {
+    if (by.id && r.id) return r.id !== by.id;
+    const sameTitle = (r.title||'') === (by.title||'');
+    const sameLon = Math.abs((r.lon||0) - (by.lon||0)) < 1e-7;
+    const sameLat = Math.abs((r.lat||0) - (by.lat||0)) < 1e-7;
+    return !(sameTitle && sameLon && sameLat);
+  });
+  savePermanentStationsToLS(out);
+}
+
+// Add a permanent (black) station with a Delete button in its popup
+function addPermanentStation(rec){
+  const { lon, lat } = rec || {};
+  if (!(isFinite(lon) && isFinite(lat))) return;
+  const id = rec.id || genId('perm');
+  const title = rec.title || 'Station';
+
+  const el = document.createElement('div');
+  el.className = 'mk station';
+  if (title) el.title = title;
+
+  const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
+    .setLngLat([lon, lat])
+    .addTo(map);
+
+  const html = `
+    <div class="popup">
+      <div class="h">${escapeHTML(title)}</div>
+      <div>Installed</div>
+      <div style="margin-top:6px">
+        <button onclick="window.__deleteStation('${id}','perm')">Delete</button>
+      </div>
+    </div>`;
+  marker.setPopup(new maplibregl.Popup({ closeButton:true, closeOnClick:true }).setHTML(html));
+
+  permStations.push({ id, marker, title, lon, lat });
+}
+
+// Turn a temp (green) marker into permanent (black) and persist it
+window.__makePermanentStation = function(tmpId){
+  const rec = tempStations.find(r => r.id === tmpId);
+  if (!rec) return;
+
+  // read its current position
+  const ll = rec.marker.getLngLat();
+  const title = rec.title || 'Station';
+  const newRec = { id: genId('perm'), lon: ll.lng, lat: ll.lat, title };
+
+  // remove temp from map & array
+  rec.marker.remove();
+  tempStations = tempStations.filter(r => r.id !== tmpId);
+
+  // add as permanent + persist
+  addPermanentStation(newRec);
+  const saved = loadPermanentStationsFromLS();
+  saved.push(newRec);
+  savePermanentStationsToLS(saved);
+};
+
+// Delete a station (temp or permanent) by id
+window.__deleteStation = function(id, kind){
+  if (kind === 'temp') {
+    const rec = tempStations.find(r => r.id === id);
+    if (!rec) return;
+    rec.marker.remove();
+    tempStations = tempStations.filter(r => r.id !== id);
+    return;
+  }
+  // permanent
+  const idx = permStations.findIndex(r => r.id === id);
+  if (idx === -1) return;
+  const rec = permStations[idx];
+  rec.marker.remove();
+  permStations.splice(idx,1);
+  removePermFromLS({ id: rec.id, lon: rec.lon, lat: rec.lat, title: rec.title });
+};
+
+
+  // ---------- Geocoding (cached) ----------
+// ---- Geocoding helpers (GLOBAL but guided) ----
+function boundsToViewbox(b){ const sw=b.getSouthWest(), ne=b.getNorthEast(); return [sw.lng, sw.lat, ne.lng, ne.lat]; }
+
+// --- geocode cache & helpers (must come before geocoder functions) ---
+const GEO_KEY = 'geocache.v1';
+let GEO;
+try { GEO = JSON.parse(localStorage.getItem(GEO_KEY) || '{}'); } catch { GEO = {}; }
+function saveGeo(){ try { localStorage.setItem(GEO_KEY, JSON.stringify(GEO)); } catch {} }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+async function geocodeAddressStrict(h, postalInput, stName, postalBBox) {
+  // choose bias: postal box first, else state box
+  const vb = postalBBox ? boundsToViewbox(postalBBox)
+           : (stName && stateBounds.has(stName) ? boundsToViewbox(stateBounds.get(stName)) : null);
+  const countryHint = /^\d{5}(-\d{4})?$/.test(String(postalInput)) ? 'us' : null;
+
+  const key = `strict|${h.address||''}|${h.name||''}|${h.postal||h.postalDigits5||postalInput}|${stName||''}|${vb?vb.join(','):''}|${countryHint||''}`.toLowerCase();
+  if (GEO[key]) return GEO[key];
+  await sleep(800);
+
+  // 1) Structured search (street/state/postal) + bounded viewbox
+  const p1 = new URLSearchParams({ format:'json', limit:'1', addressdetails:'1' });
+  if (h.address) p1.append('street', h.address);
+  if (stName)   p1.append('state',  stName);
+  const pc = (h.postal || h.postalDigits5 || postalInput);
+  if (pc) p1.append('postalcode', pc);
+  if (countryHint) p1.append('countrycodes', countryHint);
+  if (vb){ p1.append('viewbox', vb.join(',')); p1.append('bounded','1'); }
+  let url = `https://nominatim.openstreetmap.org/search?${p1.toString()}`;
+  let r   = await fetch(url, { headers:{'Accept':'application/json'} });
+  let j   = await r.json();
+  let f   = j[0];
+
+  // 2) Fallback: free-text with the same bias
+  if (!f) {
+    const q = [h.name, h.address, stName, pc].filter(Boolean).join(', ');
+    const p2 = new URLSearchParams({ format:'json', q, limit:'1', addressdetails:'1' });
+    if (countryHint) p2.append('countrycodes', countryHint);
+    if (vb){ p2.append('viewbox', vb.join(',')); p2.append('bounded','1'); }
+    url = `https://nominatim.openstreetmap.org/search?${p2.toString()}`;
+    r   = await fetch(url, { headers:{'Accept':'application/json'} });
+    j   = await r.json();
+    f   = j[0];
+  }
+
+  if (!f) return null;
+  const res = { lon:+f.lon, lat:+f.lat, display:f.display_name, cc:(f.address?.country_code||'').toUpperCase() };
+  GEO[key] = res; saveGeo();
+  return res;
+}
+
+async function geocodePostalArea(postal, {countryHint=null, viewbox=null}={}){
+  const params = new URLSearchParams({ format:'json', postalcode:String(postal), limit:'1', addressdetails:'1' });
+  if (countryHint) params.append('countrycodes', countryHint);
+  if (viewbox){ params.append('viewbox', viewbox.join(',')); params.append('bounded','1'); }
+  const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
+  const res = await fetch(url, { headers:{ 'Accept':'application/json' }});
+  const j = await res.json(); const f = j[0]; if (!f) return null;
+  const [s,n,w,e] = (f.boundingbox||[]).map(Number);
+  return { bbox:new maplibregl.LngLatBounds([w,s],[e,n]), cc:(f.address?.country_code||'').toUpperCase() };
+}
+// Coord sanity + swap/microdegree fix
+const US_BOUNDS = new maplibregl.LngLatBounds([-125,24],[-66,50]);
+
+function normalizeLonLat(lon, lat){
+  lon = Number(lon); lat = Number(lat);
+  if (isFinite(lon) && isFinite(lat)){
+    // swapped?
+    if (Math.abs(lon) <= 90 && Math.abs(lat) > 90){ const t=lon; lon=lat; lat=t; }
+    // microdegrees?
+    if (Math.abs(lon) > 180 && Math.abs(lon) < 1e7) lon = lon/1e6;
+    if (Math.abs(lat) >  90 && Math.abs(lat) < 1e7) lat = lat/1e6;
+    if (Math.abs(lon) <= 180 && Math.abs(lat) <= 90) return [lon,lat];
+  }
+  return null;
+}
+function insideBounds(bounds, lon, lat){ return bounds && !bounds.isEmpty() && bounds.contains([lon,lat]); }
+
+function looksLikeUSZip(s){ return /^\d{5}(?:-\d{4})?$/.test(String(s).trim()); }
+function bestStateNameFromRows(rows){
+  const states = rows.map(r => (r.state||'').trim()).filter(Boolean);
+  if (!states.length) return null;
+  const uniq = Array.from(new Set(states.map(s=>s.toLowerCase())));
+  if (uniq.length === 1){
+    const want = states[0].toLowerCase();
+    for (const name of stateBounds.keys()) if (name.toLowerCase() === want) return name;
+  }
+  return null;
+}
+function buildHospitalQuery(h, postalInput, stName){
+  const parts = [];
+  if (h.name) parts.push(h.name);
+  if (h.address) parts.push(h.address);
+  if (stName) parts.push(stName);
+  const z = h.postal || h.postalDigits5 || postalInput;
+  if (z) parts.push(z);
+  return parts.filter(Boolean).join(', ');
+}
+function buildGeocodeHints(postalInput, rows){
+  let countryHint = null;
+  if (looksLikeUSZip(postalInput)) countryHint = 'us';
+  if (!countryHint && rows.some(r => /^[A-Z]{2}$/.test(r.state||'') )) countryHint = 'us';
+  const stName = bestStateNameFromRows(rows);
+  const viewbox = (stName && stateBounds.has(stName)) ? boundsToViewbox(stateBounds.get(stName)) : null;
+  return { countryHint, viewbox, stName };
+}
+  // ---------- Excel loader + normalizer ----------
+  let hospitalsData = []; // [{name,address,postal,postalKey,lat,lon,wait,visits,zip,...}]
+  
+
+function N(k,obj){ return obj[k] ?? obj[k?.toLowerCase?.()] ?? obj[k?.toUpperCase?.()]; }
+function normalizePostal(s){ return s==null ? '' : String(s).trim().toUpperCase().replace(/[\s-]/g,''); }
+
+
+// Canonical “normalize”: remove spaces/dashes, uppercase
+function normalizePostal(s){
+  if (s == null) return '';
+  return String(s).trim().toUpperCase().replace(/[\s-]/g,'');
+}
+
+// 2-letter US state abbreviations (regex fragment)
+const US_ABBR_RE = '(?:A[LKZR]|C[AOT]|D[CE]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|P[AR]|RI|S[CD]|T[NX]|UT|V[AIT]|W[AIVY])';
+
+// Extract a US ZIP from a free-form address string.
+// Returns the 5-digit ZIP as a string (e.g., "06105") or "" if none.
+function extractUSZipFromAddress(address){
+  if (!address) return '';
+  const s = String(address);
+
+  // 1) Prefer "... CT 06105" i.e., state abbr followed by ZIP (+ optional ZIP+4)
+  const m1 = s.match(new RegExp(`\\b${US_ABBR_RE}\\s*(\\d{5})(?:-\\d{4})?\\b`, 'i'));
+  if (m1) return m1[1];
+
+  // 2) Prefer a ZIP at the end of the string
+  const m2 = s.match(/\b(\d{5})(?:-\d{4})?\s*$/);
+  if (m2) return m2[1];
+
+  // 3) Fallback: take the **last** 5-digit group anywhere (avoids house numbers)
+  const all = [...s.matchAll(/\b(\d{5})(?:-\d{4})?\b/g)];
+  if (all.length) return all[all.length - 1][1];
+
+  return '';
+}
+function toNum(v){
+  if (v == null || v === '') return null;
+  let s = String(v).trim();
+  // fix unicode minus / dashes
+  s = s.replace(/[−–—]/g, '-');
+  // if comma is used as decimal and no dot, convert
+  if (s.indexOf('.') === -1 && /,\d+$/.test(s)) s = s.replace(',', '.');
+  // remove thousands separators/spaces (but keep leading minus)
+  s = s.replace(/(?!^[-+])[, ]/g, '');
+  // strip everything except digits, sign, dot, exponent
+  s = s.replace(/[^0-9eE+.\-]/g, '');
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeRowKeys(row){
+  const out = {};
+  for (const [k,v] of Object.entries(row)){
+    const nk = String(k).replace(/\s+/g,'').toLowerCase(); // trim + remove spaces
+    out[nk] = v;
+  }
+  return out;
+}
+function G(cleanRow, ...keys){
+  // keys like 'lon','longitude','lng','x'
+  for (const k of keys){
+    const nk = String(k).replace(/\s+/g,'').toLowerCase();
+    if (cleanRow[nk] !== undefined && cleanRow[nk] !== '') return cleanRow[nk];
+  }
+  return '';
+}
+
+function normHospital(r){
+  const clean = normalizeRowKeys(r);        
+
+  const name    = G(clean,'name','hospitalname','hospit al_name') || r.Name || r['Hospital Name'];
+  const address = G(clean,'address','street') || r.Address;
+
+  let postal = G(clean,'zip','postal','postalcode');        // you can keep your ZIP fallback below if you like
+
+  if (!postal && address) postal = extractUSZipFromAddress(address);
+
+  const postalKey = normalizePostal(postal);
+  const digits    = postalKey.replace(/\D/g,'');
+  const digits5   = digits ? digits.padStart(5,'0') : '';
+
+  const lat = toNum(G(clean,'lat','latitude','y'));
+  const lon = N('Long',r);
+ 
+  const wait   = G(clean,'averagewaittime','avgwait','avg_wait');
+  const visits = G(clean,'annualervisits','ervisits','annual_er_visits');
+
+  return { name, address, postal, postalKey, postalDigits:digits, postalDigits5:digits5, lat, lon, wait, visits };
+}
+
+  async function loadHospitalsFromExcel(){
+  try{
+    const url = new URL(HOSPITALS_XLSX, location.href).href;
+    console.log('[HOSP] fetching:', url);
+    const res = await fetch(HOSPITALS_XLSX, { cache:'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    const ab  = await res.arrayBuffer();
+    const wb  = XLSX.read(ab, { type:'array' });
+    const ws  = wb.Sheets[wb.SheetNames[0]];
+    const rows= XLSX.utils.sheet_to_json(ws, { defval:'' });
+    console.log('Headers seen:', Object.keys(rows[0]).map(k => JSON.stringify(k)));
+
+
+    hospitalsData = rows.map(normHospital).filter(h => h.name && (h.postalKey || h.address));
+
+    // Debug summary in console
+    const withPostal = hospitalsData.filter(h => h.postalKey).length;
+    console.log(`[HOSP] parsed ${hospitalsData.length} rows; with postal: ${withPostal}`);
+    console.table(
+  hospitalsData.slice(0,108).map(h => ({
+    name: h.name,
+    postal: h.postal,
+    postalKey: h.postalKey,
+    postalDigits: h.postalDigits,
+    postalDigits5: h.postalDigits5,
+    address: h.address,
+    lat: h.lat,
+    lon: h.lon
+  }))
+);
+  } catch(e){
+    console.warn('Hospitals Excel load failed:', e);
+    alert(`Could not load ${HOSPITALS_XLSX}. Make sure it’s in the same folder as index.html, or update HOSPITALS_XLSX.`);
+    hospitalsData = [];
+  }
+}
+
+  function hospitalPopupHTML(h, origin){
+  const parts = [];
+  parts.push(`<div class="h">${escapeHTML(h.name || 'Hospital')}</div>`);
+
+  // Coerce to numbers (strings won't pass Number.isFinite)
+  const hLon = h && h.lon != null ? Number(h.lon) : NaN;
+  const hLat = h && h.lat != null ? Number(h.lat) : NaN;
+  const oLon = origin && origin.lon != null ? Number(origin.lon) : NaN;
+  const oLat = origin && origin.lat != null ? Number(origin.lat) : NaN;
+  console.log(hLon);
+
+
+  if (Number.isFinite(oLon) && Number.isFinite(oLat) &&
+      Number.isFinite(hLon) && Number.isFinite(hLat)) {
+    const d = milesBetween(oLon, oLat, hLon, hLat);
+    parts.push(
+      `<div>Distance from ${escapeHTML(origin.label || 'address')}: ${fmtMi(d)}</div>`
+    );
+  }
+
+  if (h.visits) parts.push(`<div>Annual ER visits: ${Number(h.visits).toLocaleString()}</div>`);
+  if (h.wait != null && String(h.wait) !== '')
+    parts.push(`<div>Average wait: ${escapeHTML(h.wait)}${/min/i.test(h.wait)? '':' min'}</div>`);
+  if (h.address) parts.push(`<div style="margin-top:4px;color:#555">${escapeHTML(h.address)}</div>`);
+  return `<div class="popup">${parts.join('')}</div>`;
+}
+
+  // ---------- Keep references ----------
+  let hospitalMarkers = [];
+  let stationMarkers  = [];
+  let usaBounds = null;
+
+  // Hard-coded stations (edit these)
+  const HARD_STATIONS = [
+    { title:'HHC: The Village',   lon:-72.6737, lat:41.747 },
+    { title:'HHC: Stop and Shop', lon:-71.8809, lat:41.84  },
+    { title:'OYC',                 lon:-80.200,  lat:25.787 },
+    { title:'Auburn: LaFayette',   lon:-85.4101, lat:32.883 },
+    { title:'Auburn: Wilcox',      lon:-87.483,  lat:32.176 },
+    { title:'Auburn: Greene',      lon:-88.028,  lat:32.792 },
+    { title:'Auburn: Hale',        lon:-87.741,  lat:32.877 },
+    { title:'Auburn: Sumter',      lon:-88.159,  lat:32.821 },
+    { title:'Tuskegee University', lon:-85.707,  lat:32.429 },
+    { title:'UHC: Milam',          lon:-96.9812, lat:30.855 },
+    { title:'SHBP',                lon:-84.386,  lat:33.753 },
+    { title:'CareSource / Valley', lon:-84.937,  lat:32.424 },
+    { title:'Tampa Hope',          lon:-82.4177, lat:27.958 },
+    { title:'Warren Henry Motor Group', lon:-80.153, lat:25.914 },
+    { title:'South Carolina State University', lon:-80.849, lat:33.498 },
+    { title:'UHC/Molina: Navarro', lon:-96.500,  lat:32.0807 },
+    { title:'Handy',               lon:-80.146,  lat:26.154 },
+    { title:'UHC: Bruni',          lon:-98.8408, lat:27.429 },
+    { title:'HHC: Bradley Airport',lon:-72.686,  lat:41.939 },
+    { title:'UHC/Molina: Fort Worth', lon:-97.328, lat:32.688 },
+    { title:'UHC: Missouri City',  lon:-95.525,  lat:29.597 },
+    { title:'Elevance: Washoe County', lon:-119.799, lat:39.538 },
+    { title:'Hidalgo/McAllen TX', lon:-98.215, lat: 26.208}
+    
+  ];
+
+  map.on('load', async () => {
+    // Counties GeoJSON
+    const resp = await fetch(GEOJSON_URL, { cache: 'no-store' });
+    const geo = await resp.json();
+
+    // Build state list + bounds
+    usaBounds = new maplibregl.LngLatBounds();
+    const stateSet = new Set();
+    (geo.features || []).forEach(f => {
+      const s = f?.properties?.[STATE_PROP];
+      if (!s) return;
+      stateSet.add(s);
+      let b = stateBounds.get(s);
+      if (!b) b = new maplibregl.LngLatBounds();
+      extendBoundsFromGeom(b, f.geometry);
+      extendBoundsFromGeom(usaBounds, f.geometry);
+      stateBounds.set(s, b);
+    });
+
+    // Populate state dropdown (for counties filter only)
+    const sel = document.getElementById('stateSelect');
+    [...stateSet].sort().forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name;
+      sel.appendChild(opt);
+    });
+
+    // Add counties source + layers
+    map.addSource(SOURCE_ID, { type: 'geojson', data: geo });
+    map.addLayer({ id: FILL_LAYER, type: 'fill', source: SOURCE_ID,
+      paint: { 'fill-color': ['get', FILL_PROP], 'fill-opacity': 0.85 }});
+    map.addLayer({ id: LINE_LAYER, type: 'line', source: SOURCE_ID,
+      paint: { 'line-color': '#ffffff', 'line-width': 0.5 }});
+
+    // Stations: hard-coded + restored permanents
+    HARD_STATIONS.forEach(addPermanentStation);
+    loadPermanentStationsFromLS().forEach(addPermanentStation);
+
+    // Legend (auto-detected)
+    const keyScores = {}; for (const k of HPSA_KEYS) keyScores[k]=0;
+    for (const f of geo.features||[]) for (const k of HPSA_KEYS) if (f.properties && f.properties[k]!=null) keyScores[k]++;
+    let HPSA_KEY = HPSA_KEYS[0], max=-1; for (const [k,c] of Object.entries(keyScores)) if (c>max){max=c;HPSA_KEY=k;}
+    const catColor = new Map();
+    for (const f of geo.features || []) {
+      const cat = (f.properties?.[HPSA_KEY] ?? 'Unknown') + '';
+      const col = f.properties?.[FILL_PROP] || '#cccccc';
+      if (!catColor.has(cat)) catColor.set(cat, col);
+    }
+    const legend = document.getElementById('legend');
+    for (const [cat,col] of Array.from(catColor.entries()).sort((a,b)=>a[0].localeCompare(b[0]))) {
+      const item = document.createElement('div');
+      item.className = 'legend-item';
+      item.innerHTML = `<span class="swatch" style="background:${col};"></span><span style="font-size:12px;">${cat}</span>`;
+      legend.appendChild(item);
+    }
+    legend.addEventListener('click', (e) => {
+      const item = e.target.closest('.legend-item'); if (!item) return;
+      const label = item.textContent.trim();
+      const filter = label === 'Unknown' ? ['!has', HPSA_KEY] : ['==', ['get', HPSA_KEY], label];
+      map.setFilter(FILL_LAYER, filter); map.setFilter(LINE_LAYER, filter);
+    });
+
+    // Counties state filter (no hospital logic)
+    function applyStateFilter(stateName){
+      const filter = stateName ? ['==', ['get', STATE_PROP], stateName] : null;
+      [FILL_LAYER, LINE_LAYER].forEach(id => map.setFilter(id, filter));
+    }
+    function zoomTo(stateName){
+      const b = stateName ? stateBounds.get(stateName) : usaBounds;
+      if (b && !b.isEmpty()) map.fitBounds(b, { padding: 40, duration: 700 });
+    }
+    document.getElementById('btnStateGo').addEventListener('click', () => {
+      const v = sel.value; applyStateFilter(v); zoomTo(v || null);
+    });
+    document.getElementById('btnStateClear').addEventListener('click', () => {
+      sel.value = ''; applyStateFilter(null); zoomTo(null);
+    });
+
+    // Load hospitals once
+    await loadHospitalsFromExcel();
+
+    // Hospitals by ZIP (wide fit + not-too-deep zoom)
+    function clearHospitals(){ hospitalMarkers.forEach(m => m.remove()); hospitalMarkers = []; }
+document.getElementById('btnHosp').addEventListener('click', async () => {
+  const postalInput = document.getElementById('zip').value.trim();
+  if (!postalInput) { alert('Enter a postal/ZIP code'); return; }
+
+  const key   = normalizePostal(postalInput);
+  const digs  = key.replace(/\D/g,'');
+  const digs5 = digs ? digs.padStart(5,'0') : '';
+
+  // match rows for this postal
+  const rows = hospitalsData.filter(h =>
+    (h.postalKey && h.postalKey === key) ||
+    (digs && h.postalDigits === digs) ||
+    (digs5 && h.postalDigits5 === digs5)
+  );
+  if (!rows.length) { alert('No hospitals for that postal code in your Excel.'); return; }
+
+  // geocode/zoom hints
+  const { countryHint, viewbox, stName } = buildGeocodeHints(postalInput, rows);
+
+  // get postal bbox (also used to bias individual hospital geocodes)
+  let postalArea = null;
+  try { postalArea = await geocodePostalArea(postalInput, { countryHint, viewbox }); } catch {}
+  const markerViewbox = postalArea?.bbox ? boundsToViewbox(postalArea.bbox)
+                        : (stName && stateBounds.has(stName) ? boundsToViewbox(stateBounds.get(stName))
+                        : viewbox);
+
+  // zoom for context
+  let fitted = false;
+  if (stName && stateBounds.has(stName)) {
+    fitSmart(stateBounds.get(stName), { padding: 40, maxZoom: 6.5 });
+    fitted = true;
+  } else if (postalArea?.bbox) {
+    fitSmart(postalArea.bbox, { padding: 60, maxZoom: 8 });
+    fitted = true;
+  }
+
+  // Place markers from sheet coords ONLY
+hospitalMarkers.forEach(m => m.remove()); hospitalMarkers = [];
+let anyPlaced = false;
+for (const h of rows) {
+  if (!(Number.isFinite(h.lon) && Number.isFinite(h.lat))) {
+    console.warn('Skip: no usable coords in sheet for', h.name, h.lon, h.lat);
+    continue;
+  }
+  const m = makeMarker('hospital', h.lon, h.lat, h.name);
+  m.setPopup(new maplibregl.Popup({ closeButton:true, closeOnClick:true }).setHTML(hospitalPopupHTML(h)));
+  hospitalMarkers.push(m);
+  anyPlaced = true;
+}
+if (!anyPlaced) {
+  alert('No rows in this ZIP have usable latitude/longitude.');
+}
+});
+
+// Show hospitals within a radius of a point (uses sheet coords only)
+async function showHospitalsNearPoint(lon, lat, radiusMi = 20){
+  // reuse Hospitals Clear button behavior
+  function clearHospitals(){ hospitalMarkers.forEach(m => m.remove()); hospitalMarkers = []; }
+  clearHospitals();
+
+  const bounds = new maplibregl.LngLatBounds();
+  bounds.extend([lon, lat]); // include the station itself
+
+  
+
+  let found = 0;
+  for (const h of hospitalsData){
+    if (Number.isFinite(h.lon) && Number.isFinite(h.lat)){
+      const d = distanceMiles(lon, lat, h.lon, h.lat);
+      const visitsLine = (h.visits != null && String(h.visits).trim() !== '')
+  ? `\n                 <div>Annual ER visits: ${Number(h.visits).toLocaleString()}</div>`
+  : '';
+
+const waitVal = (h.wait != null && String(h.wait).trim() !== '') ? String(h.wait) : '';
+const waitLine = waitVal
+  ? `\n                 <div>Average wait: ${escapeHTML(waitVal)}${/min/i.test(waitVal) ? '' : ' min'}</div>`
+  : '';
+      if (d <= radiusMi){
+        const m = makeMarker('hospital', h.lon, h.lat, h.name);
+	m.setPopup(
+  new maplibregl.Popup({ closeButton:true, closeOnClick:true })
+    .setHTML(
+      `<div class="popup">
+         <div class="h">${escapeHTML(h.name || 'Hospital')}</div>
+         ${h.address ? `<div style="color:#555">${escapeHTML(h.address)}</div>` : ''}
+         ${visitsLine}${waitLine}
+         <div>~${d.toFixed(1)} mi away</div>
+       </div>`
+    )
+);        hospitalMarkers.push(m);
+        bounds.extend([h.lon, h.lat]);
+        found++;
+      }
+    }
+  }
+
+  if (found){
+    // keep context—see station + all hospitals; cap zoom so we don't zoom too deep
+    map.fitBounds(bounds, { padding: 60, duration: 700, maxZoom: 10 });
+  } else {
+    alert('No hospitals within 20 miles of this station.');
+  }
+}
+
+// expose a helper so popups can call it
+window.__showHospitalsNear = (lng, lat, mi=20) => showHospitalsNearPoint(lng, lat, mi);
+
+async function geocodeAddress(q){
+  if (!q) return null;
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
+  const r = await fetch(url, { headers:{ 'Accept':'application/json' } });
+  const j = await r.json();
+  const f = j[0]; if (!f) return null;
+  return { lon:+f.lon, lat:+f.lat, display:f.display_name };
+}
+
+    // Stations add/clear
+    async function geocodeStation(addr){ return geocodeAddress(addr); }
+    document.getElementById('btnStationsAdd').addEventListener('click', async () => {
+      const txt = document.getElementById('stations').value.trim();
+      if (!txt) return;
+      const lines = txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+      for (const line of lines) {
+        try {
+          await sleep(1100);
+          const g = await geocodeStation(line);
+          if (!g) continue;
+          const m = makeMarker('station-temp', g.lon, g.lat, line);
+          const id = `tmp_${++ST_SEQ}`;
+          tempStations.push({ id, marker:m, title:line });
+         m.setPopup(new maplibregl.Popup({ closeButton:true, closeOnClick:true }).setHTML(
+  `<div class="popup">
+     <div class="h">${escapeHTML(line)}</div>
+     ${g.display?`<div>${escapeHTML(g.display)}</div>`:''}
+     <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+       <button onclick="window.__makePermanentStation('${id}')">Make permanent</button>
+       <button onclick="window.__deleteStation('${id}','temp')">Delete</button>
+     </div>
+   </div>`
+));
+
+// Automatically show nearby hospitals (20 miles) for each added station:
+window.__showHospitalsNear(g.lon, g.lat, 20);
+
+          
+        } catch (e) { console.warn('Station geocode failed:', line, e); }
+      }
+    });
+
+    document.getElementById('btnStationsClear').addEventListener('click', () => {
+      tempStations.forEach(r => r.marker.remove());
+      clearHospitals();
+
+      tempStations = [];
+    });
+  });
+})();
+</script>
+</body>
+</html>
